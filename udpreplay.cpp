@@ -19,6 +19,9 @@
 #include <iostream>
 #include <memory>
 #include <vector>
+#include <unordered_map>
+#include <algorithm>
+#include <iomanip>
 #include <chrono>
 #include <stdexcept>
 #include <functional>
@@ -49,6 +52,9 @@ struct callback_data
     std::uint64_t bytes = 0;
 };
 
+static std::unordered_map<uint64_t,
+           std::unordered_map<uint16_t, std::vector<u_char>>> pktbuf;
+
 static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes)
 {
     const unsigned int eth_hsize = 14;
@@ -63,43 +69,77 @@ static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *by
         bytes += eth_hsize;
         len -= eth_hsize;
         const unsigned int ip_hsize = (bytes[0] & 0xf) * 4;
-        std::uint32_t dst_host;   // big endian
-        std::memcpy(&dst_host, bytes + 16, sizeof(dst_host));
+
+        std::uint16_t id;
+        std::uint16_t frag_offs;
+        std::uint16_t flags;
+        std::uint64_t hosts;
+        std::uint32_t dst_host;  // big endian
+
+        std::memcpy(&frag_offs, bytes + 6,  sizeof(frag_offs));
+        std::memcpy(&id,        bytes + 4,  sizeof(id));
+        std::memcpy(&hosts,     bytes + 12, sizeof(hosts));
+        std::memcpy(&dst_host,  bytes + 16, sizeof(dst_host));
+
+        frag_offs = ntohs(frag_offs);
+        flags     = (frag_offs & 0xe000);
+        frag_offs = (frag_offs & 0x1fff) * 8;
+
         if (len >= ip_hsize + 8)
         {
             bytes += ip_hsize;
             len -= ip_hsize;
-            std::uint16_t dst_port;     // big endian
-            std::memcpy(&dst_port, bytes + 2, sizeof(dst_port));
-            const unsigned int udp_hsize = 8;
-            bytes += udp_hsize;
-            len -= udp_hsize;
 
-            callback_data *data = (callback_data *) user;
-            duration timestamp;
-            if (data->use_timestamps)
+            if (pktbuf[hosts].count(id) == 0)
             {
-                if (data->packets == 0)
-                    data->start = h->ts;
-                auto ts = std::chrono::seconds(h->ts.tv_sec - data->start.tv_sec)
-                    + std::chrono::nanoseconds(h->ts.tv_usec - data->start.tv_usec);
-                timestamp = std::chrono::duration_cast<duration>(ts);
+                pktbuf[hosts][id] = std::vector<uint8_t>(65535, 0);
             }
-            else
+
+            auto& pbuf = pktbuf[hosts][id];
+            std::copy(bytes, bytes + len - 1, pbuf.begin() + frag_offs);
+            bytes = pbuf.data();
+
+            if ((flags & 0x2000) == 0) //MF not set
             {
-                timestamp = std::chrono::duration_cast<duration>(
-                    data->per_byte * data->bytes + data->per_packet * data->packets);
+                std::uint16_t dst_port; // big endian
+                std::uint16_t udp_len;  // big endian
+                std::memcpy(&dst_port, bytes + 2, sizeof(dst_port));
+                std::memcpy(&udp_len,  bytes + 4, sizeof(udp_len));
+                udp_len = ntohs(udp_len) - 8;  // host endian
+                const unsigned int udp_hsize = 8;
+                bytes += udp_hsize;
+                len -= udp_hsize;
+
+                callback_data *data = (callback_data *) user;
+                duration timestamp;
+                if (data->use_timestamps)
+                {
+                    if (data->packets == 0)
+                        data->start = h->ts;
+                    auto ts = std::chrono::seconds(h->ts.tv_sec - data->start.tv_sec)
+                        + std::chrono::nanoseconds(h->ts.tv_usec - data->start.tv_usec);
+                    timestamp = std::chrono::duration_cast<duration>(ts);
+                }
+                else
+                {
+                    timestamp = std::chrono::duration_cast<duration>(
+                        data->per_byte * data->bytes + data->per_packet * data->packets);
+                }
+                if (!data->use_destination)
+                {
+                    asio::ip::address_v4::bytes_type dst_raw = data->destination.address().to_v4().to_bytes();
+                    std::memcpy(&dst_host, &dst_raw, sizeof(dst_host));
+                    dst_port = htons(data->destination.port());
+                }
+
+                if (udp_len < 65508)
+                {
+                    packet p = {bytes, udp_len, timestamp, dst_host, dst_port};
+                    data->add_packet(p);
+                    data->packets++;
+                    data->bytes += udp_len;
+                }
             }
-            if (!data->use_destination)
-            {
-                asio::ip::address_v4::bytes_type dst_raw = data->destination.address().to_v4().to_bytes();
-                std::memcpy(&dst_host, &dst_raw, sizeof(dst_host));
-                dst_port = htons(data->destination.port());
-            }
-            packet p = {bytes, len, timestamp, dst_host, dst_port};
-            data->add_packet(p);
-            data->packets++;
-            data->bytes += len;
         }
     }
 }
